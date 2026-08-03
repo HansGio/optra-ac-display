@@ -1,0 +1,527 @@
+#include <U8g2lib.h>
+#include <ESP32Encoder.h>
+#include "BluetoothSerial.h"
+
+#define LCD_BL_PIN 35     // Backlight
+
+#define LCD_DATA_PIN 36  // SDIN
+#define LCD_CLK_PIN 39   // SCLK
+#define LCD_EN_PIN 34    // SEN
+
+#define OLED_CS_PIN 5 
+#define OLED_DC_PIN 13 
+#define OLED_RESET_PIN 12
+
+#define TEMP_OUT_CLK_PIN 33
+#define TEMP_OUT_DT_PIN 25
+#define FAN_OUT_CLK_PIN 32
+#define FAN_OUT_DT_PIN 26
+
+#define TEMP_CLK_PIN 27
+#define TEMP_DT_PIN 15
+#define FAN_CLK_PIN 14
+#define FAN_DT_PIN 2 
+
+#define BUTTON_AUTO_PIN 21      
+#define BUTTON_AC_PIN 4         
+#define BUTTON_MODE_PIN 22      
+#define BUTTON_OFF_PIN 16       
+#define BUTTON_R_DEFROST_PIN 19 
+
+#define ENCODER_STEP_DELAY 5  // milliseconds between steps
+#define BUTTON_HOLD_DURATION 60  // button hold duration milliseconds
+
+U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI u8g2(U8G2_R0, OLED_CS_PIN, OLED_DC_PIN, OLED_RESET_PIN);
+BluetoothSerial SerialBT;
+
+TaskHandle_t displayTaskHandle;
+
+ESP32Encoder tempEncoder;
+ESP32Encoder fanEncoder;
+
+long tempOldCount = 0;
+long fanOldCount = 0;
+
+uint8_t tempCurrEncSeq = 0;
+uint8_t fanCurrEncSeq = 0;
+
+volatile uint64_t frameData = 0;
+volatile uint8_t frameLength = 0;
+
+volatile bool inFrame = false;
+volatile bool frameReady = false;
+
+uint64_t lastFrame = 0;
+
+struct FrameInfo {
+  uint8_t fanSpeed = 0;
+
+  bool acOn = false;
+  bool autoMode = false;
+  bool outsideTemp = false;
+  bool recirculation = false;
+  bool freshAir = false;
+
+  bool displayDegree = false;
+  bool displayAlwaysOn = false;
+
+  bool frontDefrost = false;
+
+  bool faceVent1 = false;
+  bool faceVent2 = false;
+  bool faceVent3 = false;
+  bool faceVent4 = false;
+
+  bool feetVent1 = false;
+  bool feetVent2 = false;
+  bool feetVent3 = false;
+  bool feetVent4 = false;
+
+  String tempD12 = "";
+  String tempD3 = "";
+};
+
+void IRAM_ATTR onClockFall() {
+  if (!inFrame) return;
+
+  frameData <<= 1;
+  frameData |= digitalRead(LCD_DATA_PIN);
+  frameLength++;
+}
+
+void IRAM_ATTR onEnableChange() {
+  if (digitalRead(LCD_EN_PIN) == HIGH) {
+    if (!frameReady) {
+      frameData = 0;
+      frameLength = 0;
+      inFrame = true;
+    }
+  } else if (inFrame) {
+    inFrame = false;
+    if (frameLength == 64) {
+      frameReady = true;
+    }
+  }
+}
+
+String decodeDigit(uint8_t segBits) {
+  switch (segBits) {
+    case 0b0000000: return "";
+    case 0b1111110: return "0";
+    case 0b0110000: return "1";
+    case 0b1101101: return "2";
+    case 0b1111001: return "3";
+    case 0b0110011: return "4";
+    case 0b1011011: return "5";
+    case 0b1011111: return "6";
+    case 0b1110010: return "7";
+    case 0b1111111: return "8";
+    case 0b1111011: return "9";
+    default: return "?";
+  }
+}
+
+FrameInfo decodeFrameInfo(const uint64_t data) {
+  FrameInfo info;
+
+  // Fan speed
+  info.fanSpeed = 0;
+  for (int i = 26; i >= 23; i--)
+    if (bitRead(data, i)) info.fanSpeed = 27 - i;
+  for (int i = 58; i >= 55; i--)
+    if (bitRead(data, i)) info.fanSpeed = 63 - i;
+
+  // Other features
+  info.acOn = bitRead(data, 15);
+  info.autoMode = bitRead(data, 5);
+  info.outsideTemp = bitRead(data, 1);
+  info.recirculation = bitRead(data, 48);
+  info.freshAir = bitRead(data, 49);
+  info.frontDefrost = bitRead(data, 16);
+
+  info.displayDegree = bitRead(data, 14);    // (?)
+  info.displayAlwaysOn = bitRead(data, 22);  // (?)
+
+  // Decode Face Vent
+  info.faceVent1 = bitRead(data, 50);
+  info.faceVent2 = bitRead(data, 51);
+  info.faceVent3 = bitRead(data, 52);
+  info.faceVent4 = bitRead(data, 53);
+
+  // Decode Feet Vent
+  info.feetVent1 = bitRead(data, 18);
+  info.feetVent2 = bitRead(data, 19);
+  info.feetVent3 = bitRead(data, 20);
+  info.feetVent4 = bitRead(data, 21);
+
+  // Decode Temp
+  uint8_t seg1 =
+    bitRead(data, 34) << 6 | 
+    bitRead(data, 35) << 5 | 
+    bitRead(data, 36) << 4 | 
+    bitRead(data, 37) << 3 | 
+    bitRead(data, 4) << 2 | 
+    bitRead(data, 2) << 1 | 
+    bitRead(data, 3) << 0;
+
+  uint8_t seg2 =
+    bitRead(data, 38) << 6 | 
+    bitRead(data, 39) << 5 | 
+    bitRead(data, 40) << 4 | 
+    bitRead(data, 41) << 3 | 
+    bitRead(data, 8) << 2 | 
+    bitRead(data, 6) << 1 | 
+    bitRead(data, 7) << 0;
+
+  uint8_t seg3 =
+    bitRead(data, 42) << 6 | 
+    bitRead(data, 43) << 5 | 
+    bitRead(data, 44) << 4 | 
+    bitRead(data, 45) << 3 | 
+    bitRead(data, 12) << 2 | 
+    bitRead(data, 10) << 1 | 
+    bitRead(data, 11) << 0;
+
+  if (seg1 == 0b0001110 && seg2 == 0b0011101) info.tempD12 = "Lo";
+  else if (seg1 == 0b0110111 && seg2 == 0b0110000) info.tempD12 = "Hi";
+  else {
+    info.tempD12 += decodeDigit(seg1);
+    info.tempD12 += decodeDigit(seg2);
+    info.tempD3 = decodeDigit(seg3);
+  }
+
+  return info;
+}
+
+static const unsigned char image_ac_bits[] U8X8_PROGMEM = {0x80,0x00,0xc8,0x09,0x8c,0x18,0xce,0x39,0x90,0x04,0xa0,0x02,0xca,0x29,0x7f,0x7f,0xca,0x29,0xa0,0x02,0x90,0x04,0xce,0x39,0x8c,0x18,0xc8,0x09,0x80,0x00,0x00,0x00};
+static const unsigned char image_auto__bits[] U8X8_PROGMEM = {0xfc,0xff,0xff,0x07,0x02,0x00,0x00,0x08,0x01,0x00,0x00,0x10,0x21,0xa2,0xcf,0x11,0x51,0x22,0x22,0x12,0x51,0x22,0x22,0x12,0x89,0x22,0x22,0x12,0xf9,0x22,0x22,0x12,0x89,0x22,0x22,0x12,0x89,0x1c,0xc2,0x11,0x01,0x00,0x00,0x10,0x02,0x00,0x00,0x08,0xfc,0xff,0xff,0x07};
+static const unsigned char image_car_bits[] U8X8_PROGMEM = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x1f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xe0,0x7f,0x00,0x80,0xff,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xf8,0x03,0x00,0x00,0xf0,0x0f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x0f,0x00,0x00,0x00,0x00,0xf8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xf0,0x01,0x00,0x00,0x00,0x00,0xe0,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x7e,0x00,0x00,0x00,0x00,0x00,0x80,0x0f,0x00,0x00,0x00,0x00,0x00,0x80,0x1f,0x00,0x00,0x00,0x00,0x00,0x00,0x3e,0x00,0x00,0x00,0x00,0x00,0xc0,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x78,0x00,0x00,0x00,0x00,0x00,0xe0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xe0,0x00,0x00,0x00,0x00,0xe0,0x7f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0xff,0xff,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0x3f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0xff,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xf8,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x0f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xe0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x70,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x38,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x1c,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0c,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+static const unsigned char image_fan_bits[] U8X8_PROGMEM = {0x0e,0x07,0x1f,0x0f,0x3f,0x0f,0xbf,0x0f,0x08,0x07,0x60,0x03,0x6c,0x00,0x0e,0x01,0xdf,0x0f,0xcf,0x0f,0x8f,0x0f,0x0e,0x07};
+static const unsigned char image_feet_1_bits[] U8X8_PROGMEM = {0x01,0x01,0x03,0x02};
+static const unsigned char image_feet_2_bits[] U8X8_PROGMEM = {0x02,0x03,0x06,0x06};
+static const unsigned char image_feet_3_bits[] U8X8_PROGMEM = {0x02,0x07,0x0e,0x0e,0x04};
+static const unsigned char image_feet_4_bits[] U8X8_PROGMEM = {0x08,0x0c,0x0e,0x0f,0x0f,0x0e,0x0c,0x08};
+static const unsigned char image_face_1_bits[] U8X8_PROGMEM = {0x03,0x0e};
+static const unsigned char image_face_2_bits[] U8X8_PROGMEM = {0x1e,0x1f};
+static const unsigned char image_face_4_bits[] U8X8_PROGMEM = {0x01,0x03,0x07,0x0f,0x1f};
+static const unsigned char image_fresh_air_bits[] U8X8_PROGMEM = {0x01,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x06,0x00,0x00,0x00,0x00,0x0e,0x00,0x00,0x00,0x00,0x0c,0x00,0x00,0x00,0x00,0x1c,0x00,0x00,0x00,0x00,0x18,0x00,0x00,0x00,0x00,0x38,0x00,0x00,0x00,0x00,0x70,0x00,0x00,0x00,0x00,0x60,0x00,0x00,0x00,0x00,0xe0,0x00,0x00,0x00,0x00,0xc0,0x01,0x00,0x00,0x00,0x80,0x03,0x00,0x00,0x00,0x00,0x07,0x00,0x00,0x00,0x00,0x0f,0x00,0x00,0x00,0x00,0x3e,0x00,0x00,0x00,0x00,0xfc,0x00,0x00,0x00,0x00,0xf8,0x03,0x02,0x00,0x00,0xe0,0x1f,0x06,0x00,0x00,0xc0,0x7f,0x0e,0x00,0x00,0x00,0xff,0x1f,0x00,0x00,0x00,0xfc,0x3f,0x00,0x00,0x00,0xf0,0x7f,0x00,0x00,0x00,0x80,0xff,0x00,0x00,0x00,0x00,0xfe,0x01,0x00,0x00,0x00,0xf0,0x03};
+static const unsigned char image_outside_bits[] U8X8_PROGMEM = {0xfc,0xff,0xff,0xff,0xff,0x1f,0x02,0x00,0x00,0x00,0x00,0x20,0x01,0x00,0x00,0x00,0x00,0x40,0x71,0xa2,0xcf,0xf9,0x9e,0x4f,0x89,0x22,0x22,0x22,0xa2,0x40,0x89,0x22,0x22,0x20,0xa2,0x40,0x89,0x22,0xc2,0x21,0xa2,0x47,0x89,0x22,0x02,0x22,0xa2,0x40,0x89,0x22,0x22,0x22,0xa2,0x40,0x71,0x1c,0xc2,0xf9,0x9e,0x4f,0x01,0x00,0x00,0x00,0x00,0x40,0x02,0x00,0x00,0x00,0x00,0x20,0xfc,0xff,0xff,0xff,0xff,0x1f};
+static const unsigned char image_people_bits[] U8X8_PROGMEM = {0x00,0x00,0xf0,0x00,0x00,0x00,0xf8,0x01,0x00,0x00,0xf8,0x01,0x00,0x00,0xf8,0x01,0x00,0x00,0xf8,0x01,0x00,0x00,0xf0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7c,0x00,0x00,0x00,0xfe,0x00,0x00,0x00,0xfe,0x00,0x00,0x00,0xfe,0x00,0x00,0x00,0xfe,0x00,0x00,0x00,0x7f,0x00,0x00,0x00,0x7f,0x00,0x00,0x00,0x7f,0x00,0x00,0x80,0x3f,0x00,0x00,0x80,0x3f,0x00,0x80,0xff,0x3f,0x00,0xc0,0xff,0x1f,0x00,0xe0,0xff,0x1f,0x00,0xf0,0xff,0x1f,0x00,0xf0,0xff,0x1f,0x00,0xf8,0xff,0x0f,0x00,0xfc,0x03,0x00,0x00,0xfe,0x03,0x00,0x00,0xff,0x01,0x00,0x00,0xff,0x00,0x00,0x00,0x7f,0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x3f,0x00,0x00,0x00,0x1e,0x00,0x00,0x00};
+static const unsigned char image_recirculate_bits[] U8X8_PROGMEM = {0x3c,0x7f,0x00,0x02,0x86,0x00,0x01,0x04,0x01,0x01,0x00,0x01,0x01,0x00,0x01,0x41,0x00,0x01,0xc2,0x80,0x00,0xfc,0x79,0x00};
+static const unsigned char image_windshield_bits[] U8X8_PROGMEM = {0xc0,0x1f,0x00,0x38,0xe0,0x00,0x06,0x00,0x03,0x43,0x12,0x06,0x61,0x3b,0x04,0x42,0x12,0x02,0x42,0x12,0x02,0x84,0x24,0x01,0x88,0xa4,0x00,0x88,0xa4,0x00,0x50,0x52,0x00,0x40,0x12,0x00,0x40,0x12,0x00};
+
+void displayFrameInfo(const FrameInfo& info) {
+  u8g2.clearBuffer();
+  u8g2.setFontMode(1);
+  u8g2.setBitmapMode(1);
+  if (info.displayAlwaysOn) {
+    // fan
+    u8g2.drawXBMP(213, 45, 12, 12, image_fan_bits);
+    // fan_border
+    u8g2.drawRFrame(230, 6, 20, 52, 3);
+    // people
+    u8g2.drawXBMP(168, 22, 25, 33, image_people_bits);
+    // car
+    u8g2.drawXBMP(107, 14, 112, 30, image_car_bits);
+  }
+
+  if (info.fanSpeed >= 1) {
+    // fan_speed_1
+    u8g2.drawBox(233, 51, 14, 4);
+  }
+  if (info.fanSpeed >= 2) {
+    // fan_speed_2
+    u8g2.drawBox(233, 45, 14, 4);
+  }
+  if (info.fanSpeed >= 3) {
+    // fan_speed_3
+    u8g2.drawBox(233, 39, 14, 4);
+  }
+  if (info.fanSpeed >= 4) {
+    // fan_speed_4
+    u8g2.drawBox(233, 33, 14, 4);
+  }
+  if (info.fanSpeed >= 5) {
+    // fan_speed_5
+    u8g2.drawBox(233, 27, 14, 4);
+  }
+  if (info.fanSpeed >= 6) {
+    // fan_speed_6
+    u8g2.drawBox(233, 21, 14, 4);
+  }
+  if (info.fanSpeed >= 7) {
+    // fan_speed_7
+    u8g2.drawBox(233, 15, 14, 4);
+  }
+  if (info.fanSpeed >= 8) {
+    // fan_speed_8
+    u8g2.drawBox(233, 9, 14, 4);
+  }
+
+  if (info.acOn) {
+    // ac
+    u8g2.drawXBMP(104, 6, 15, 16, image_ac_bits);
+  }
+  if (info.outsideTemp) {
+    // outside
+    u8g2.drawXBMP(6, 6, 47, 13, image_outside_bits);
+  }
+  if (info.autoMode) {
+    // auto
+    u8g2.drawXBMP(58, 6, 29, 13, image_auto__bits);
+  }
+  if (info.freshAir) {
+    // recirculate
+    u8g2.drawXBMP(111, 26, 34, 29, image_fresh_air_bits);
+  }
+  if (info.recirculation) {
+    // recirculate
+    u8g2.drawXBMP(126, 35, 17, 8, image_recirculate_bits);
+  }
+
+  if (info.frontDefrost) {
+    // windshield
+    u8g2.drawXBMP(126, 7, 19, 13, image_windshield_bits);
+  }
+
+  // face
+  if (info.faceVent1) {
+    u8g2.drawXBMP(166, 25, 4, 2, image_face_1_bits);
+  }
+  if (info.faceVent2) {
+    u8g2.drawXBMP(169, 26, 5, 2, image_face_2_bits);
+  }
+  if (info.faceVent3) {
+    u8g2.drawXBMP(173, 27, 5, 2, image_face_2_bits);
+  }
+  if (info.faceVent4) {
+    u8g2.drawXBMP(178, 24, 5, 5, image_face_4_bits);
+  }
+
+  // feet
+  if (info.feetVent1) {
+    u8g2.drawXBMP(161, 26, 2, 4, image_feet_1_bits);
+  }
+  if (info.feetVent2) {
+    u8g2.drawXBMP(162, 29, 3, 4, image_feet_2_bits);
+  }
+  if (info.feetVent3) {
+    u8g2.drawXBMP(164, 32, 4, 5, image_feet_3_bits);
+  }
+  if (info.feetVent4) {
+    u8g2.drawXBMP(167, 33, 4, 8, image_feet_4_bits);
+  }
+
+  if (info.displayDegree) {
+    // temp_unit
+    u8g2.setFont(u8g2_font_profont17_tr);
+    u8g2.drawStr(73, 44, "C");
+    // degrees
+    u8g2.drawEllipse(69, 34, 1, 1);
+  }
+  if (info.tempD3 != "") {    
+    // temp_2
+    u8g2.setFont(u8g2_font_profont22_tr);
+    u8g2.drawStr(44, 52, ("." + info.tempD3).c_str());
+  }
+  // temp_1
+  u8g2.setFont(u8g2_font_profont29_tr);
+  u8g2.drawStr(12, 52, info.tempD12.c_str());
+
+  u8g2.sendBuffer();
+}
+
+void displayTask(void * parameter) {
+  for (;;) {
+    if (frameReady) {
+      if (frameData != lastFrame) {
+        lastFrame = frameData;
+        displayFrameInfo(decodeFrameInfo(lastFrame));
+      }
+
+      frameReady = false;
+    } 
+
+    if (!digitalRead(LCD_BL_PIN)) {
+      u8g2.setContrast(255);
+    } else {
+      u8g2.setContrast(0);
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+const uint8_t encoderSequence[4][2] = {
+  { 0, 0 },
+  { 1, 0 },
+  { 1, 1 },
+  { 0, 1 },
+};
+
+uint8_t fullRotateEncoder(uint8_t pinDT, uint8_t pinCLK, uint8_t currSeq, bool clockwise) {
+  return rotateEncoder(pinDT, pinCLK, currSeq, 4, clockwise); // return new index after movement
+}
+
+uint8_t halfRotateEncoder(uint8_t pinDT, uint8_t pinCLK, uint8_t currSeq, bool clockwise) {
+  return rotateEncoder(pinDT, pinCLK, currSeq, 2, clockwise); // return new index after movement
+}
+
+uint8_t rotateEncoder(uint8_t pinDT, uint8_t pinCLK, uint8_t currSeq, uint8_t step, bool clockwise) {
+  int index = currSeq;
+  int direction = clockwise ? 1 : -1;
+
+  for (int i = 0; i < step; i++) {
+    // Advance index circularly
+    index = (index + direction + 4) % 4;
+
+    // Write the new values
+    digitalWrite(pinDT, encoderSequence[index][0]);
+    digitalWrite(pinCLK, encoderSequence[index][1]);
+
+    delay(ENCODER_STEP_DELAY); // small delay between steps
+  }
+
+  return index; // return new index after movement
+}
+
+void pressButton(uint8_t pin) {
+  digitalWrite(pin, LOW);
+  delay(BUTTON_HOLD_DURATION);
+  digitalWrite(pin, HIGH);
+}
+
+void printUint64Binary(uint64_t value) {
+  for (int i = 63; i >= 0; i--) {
+    SerialBT.print((value >> i) & 1ULL);
+    if (i % 8 == 0) SerialBT.print(" "); // optional: add space every byte
+  }
+  SerialBT.println();
+}
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("ESP32_AC_Debug");  // Bluetooth name
+
+  pinMode(BUTTON_AUTO_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(BUTTON_AC_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(BUTTON_MODE_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(BUTTON_OFF_PIN, OUTPUT_OPEN_DRAIN);
+  pinMode(BUTTON_R_DEFROST_PIN, OUTPUT_OPEN_DRAIN);
+
+  digitalWrite(BUTTON_AUTO_PIN, HIGH);
+  digitalWrite(BUTTON_AC_PIN, HIGH);
+  digitalWrite(BUTTON_MODE_PIN, HIGH);
+  digitalWrite(BUTTON_OFF_PIN, HIGH);
+  digitalWrite(BUTTON_R_DEFROST_PIN, HIGH);
+
+  pinMode(FAN_OUT_DT_PIN, OUTPUT);
+  pinMode(FAN_OUT_CLK_PIN, OUTPUT);
+  digitalWrite(FAN_OUT_DT_PIN, LOW);
+  digitalWrite(FAN_OUT_CLK_PIN, LOW);
+
+  pinMode(TEMP_OUT_DT_PIN, OUTPUT);
+  pinMode(TEMP_OUT_CLK_PIN, OUTPUT);
+  digitalWrite(TEMP_OUT_DT_PIN, LOW);
+  digitalWrite(TEMP_OUT_CLK_PIN, LOW);
+
+  ESP32Encoder::useInternalWeakPullResistors = puType::up;
+
+  tempEncoder.attachHalfQuad(TEMP_DT_PIN, TEMP_CLK_PIN);
+  tempEncoder.setCount(0);
+
+  fanEncoder.attachHalfQuad(FAN_DT_PIN, FAN_CLK_PIN);
+  fanEncoder.setCount(0);
+  
+  pinMode(LCD_BL_PIN, INPUT);
+
+  pinMode(LCD_CLK_PIN, INPUT);
+  pinMode(LCD_DATA_PIN, INPUT);
+  pinMode(LCD_EN_PIN, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(LCD_CLK_PIN), onClockFall, FALLING);
+  attachInterrupt(digitalPinToInterrupt(LCD_EN_PIN), onEnableChange, CHANGE);
+  
+  u8g2.begin();
+
+  FrameInfo info;
+  // info.displayAlwaysOn = true;
+  // info.displayDegree = true;
+  // info.tempD12="18";
+  // info.tempD3="5";
+  // info.faceVent = 1;
+  // info.feetVent = 1;
+  // info.frontDefrost = 1;
+  // info.acOn = true;
+  // info.recirculation = true;
+  // info.freshAir = true;
+  // info.autoMode = true;
+  // info.outsideTemp = true;
+  // info.fanSpeed = 8;
+  displayFrameInfo(info);
+
+  xTaskCreatePinnedToCore(
+    displayTask,
+    "Display",
+    10000,
+    NULL,
+    1,
+    &displayTaskHandle,
+    0
+  );
+}
+
+void loop() {
+  long fanCurrCount = fanEncoder.getCount();
+  if (fanCurrCount != fanOldCount) {
+    if (fanCurrCount > fanOldCount) {
+      for (int i = 0; i < fanCurrCount-fanOldCount; i++) {
+        fanCurrEncSeq = fullRotateEncoder(FAN_OUT_CLK_PIN, FAN_OUT_DT_PIN, fanCurrEncSeq, true);
+      }
+    } else {
+      for (int i = 0; i < fanOldCount-fanCurrCount; i++) {
+        fanCurrEncSeq = fullRotateEncoder(FAN_OUT_CLK_PIN, FAN_OUT_DT_PIN, fanCurrEncSeq, false);
+      }
+    }
+    fanOldCount = fanCurrCount;
+  }
+
+  long tempCurrCount = tempEncoder.getCount();
+  if (tempCurrCount != tempOldCount) {
+    if (tempCurrCount > tempOldCount) {
+      for (int i = 0; i < tempCurrCount-tempOldCount; i++) {
+        tempCurrEncSeq = halfRotateEncoder(TEMP_OUT_CLK_PIN, TEMP_OUT_DT_PIN, tempCurrEncSeq ,true);
+      }
+    } else {
+      for (int i = 0; i < tempOldCount-tempCurrCount; i++) {
+        tempCurrEncSeq = halfRotateEncoder(TEMP_OUT_CLK_PIN, TEMP_OUT_DT_PIN, tempCurrEncSeq ,false);
+      }
+    }
+    tempOldCount = tempCurrCount;
+  }
+
+  if (SerialBT.available()) {
+    char cmd = SerialBT.read();
+    if (cmd == 'A' || cmd == 'a') {
+      fanCurrEncSeq = fullRotateEncoder(FAN_OUT_CLK_PIN, FAN_OUT_DT_PIN, fanCurrEncSeq, true);
+    } else if (cmd == 'B' || cmd == 'b') {
+      fanCurrEncSeq = fullRotateEncoder(FAN_OUT_CLK_PIN, FAN_OUT_DT_PIN, fanCurrEncSeq, false);
+    }  else if (cmd == 'C' || cmd == 'c') {
+      tempCurrEncSeq = halfRotateEncoder(TEMP_OUT_CLK_PIN, TEMP_OUT_DT_PIN, tempCurrEncSeq ,true);
+    } else if (cmd == 'D' || cmd == 'd') {
+      tempCurrEncSeq = halfRotateEncoder(TEMP_OUT_CLK_PIN, TEMP_OUT_DT_PIN, tempCurrEncSeq ,false);
+    } else if (cmd == 'E' || cmd == 'e') {
+      pressButton(BUTTON_AUTO_PIN);
+    } else if (cmd == 'F' || cmd == 'f') {
+      pressButton(BUTTON_AC_PIN);
+    } else if (cmd == 'G' || cmd == 'g') {
+      pressButton(BUTTON_MODE_PIN);
+    } else if (cmd == 'H' || cmd == 'h') {
+      pressButton(BUTTON_OFF_PIN);
+    } else if (cmd == 'I' || cmd == 'i') {
+      pressButton(BUTTON_R_DEFROST_PIN);
+    }
+  }
+  
+  delay(5);
+}
